@@ -1,0 +1,8 @@
+name: security-review
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+jobs:
+  call:
+    uses: bloksphere/.github/.github/workflows/security-review-reusable.yml@main
+    secrets: inherit
