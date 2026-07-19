@@ -1,0 +1,79 @@
+name: security-review
+
+# Automated security check on every PR.
+# Layer 1: gitleaks (secrets) - scans the FULL PR diff via BASE_REF override.
+# Layer 2: Semgrep (vuln patterns) - runs via the supported container image,
+#          not the deprecated wrapper action. Fails on findings via --error.
+# Both free; both deterministic. The check FAILS (blocking merge) on findings.
+# For deeper logic review, @claude-mention the PR (Claude GitHub App, advisory).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+  actions: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history: gitleaks range + Semgrep both need it
+
+      # ---------------------------------------------------------------
+      # Layer 1: secrets
+      # gitleaks-action@v3 (@v2 is EOL on Node 20 sunset, 2026).
+      # BASE_REF forces the full PR branch diff (works around the action's
+      # narrow range + pagination fragility on rebased/long PRs).
+      # Exits non-zero on leaks -> fails job -> blocks merge.
+      # ---------------------------------------------------------------
+      - name: gitleaks (secrets)
+        id: gitleaks
+        uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_ENABLE_COMMENTS: "true"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          BASE_REF: origin/${{ github.base_ref }}
+
+      # ---------------------------------------------------------------
+      # Layer 2: vuln patterns.
+      # Uses the official semgrep container image directly - NOT the
+      # deprecated returntocorp/semgrep-action@v1 wrapper (archived; crashes
+      # on current registry rules). --error makes scan exit 1 on findings.
+      # --config auto = free Registry rules, no token required.
+      # Runs even if gitleaks failed, so both layers report.
+      # ---------------------------------------------------------------
+      - name: Semgrep scan
+        id: semgrep
+        if: always()
+        run: |
+          python -m pip install --quiet semgrep
+          set -o pipefail
+          semgrep scan --sarif --config auto --error --metrics=off . > semgrep.sarif
+      - name: Upload Semgrep SARIF
+        continue-on-error: true   # needs GHAS on private repos; tolerate failure
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      # ---------------------------------------------------------------
+      # Gate (explicit reason in the Actions log)
+      # ---------------------------------------------------------------
+      - name: Report result
+        if: always()
+        run: |
+          echo "gitleaks: ${{ steps.gitleaks.outcome }}"
+          echo "semgrep:  ${{ steps.semgrep.outcome }}"
+          if [ "${{ steps.gitleaks.outcome }}" = "failure" ] || [ "${{ steps.semgrep.outcome }}" = "failure" ]; then
+            echo "::error::Security review found blocking findings - merge blocked."
+            exit 1
+          fi
+          echo "No blocking findings."
